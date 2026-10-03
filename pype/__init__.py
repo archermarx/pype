@@ -57,9 +57,16 @@ def _echo(path, request_id, payload):
 
 
 class Server:
-    def __init__(self, path, poll_interval_s=0.1):
+    def __init__(
+        self,
+        path,
+        poll_interval_s=0.1,
+        request_decode_grace_s=1.0,
+    ):
         if poll_interval_s < 0:
             raise ValueError("Poll interval must be non-negative")
+        if request_decode_grace_s < 0:
+            raise ValueError("Request decode grace period must be non-negative")
 
         self.path = Path(path)
         self.request_path = self.path / "request"
@@ -70,6 +77,8 @@ class Server:
         self.response_path.mkdir(exist_ok=True)
 
         self.poll_interval_s = poll_interval_s
+        self.request_decode_grace_s = request_decode_grace_s
+        self._request_decode_failures: dict[Path, float] = {}
         self.log_path = self.path / "pype.log"
         self._log_lock = threading.Lock()
 
@@ -107,6 +116,7 @@ class Server:
                 fp.write(f"{line}\n")
 
     def _quarantine_request(self, request_path: Path, error: Exception) -> None:
+        self._request_decode_failures.pop(request_path, None)
         quarantine_path = request_path.with_name(
             f"{request_path.name}.{uuid.uuid4().hex}.invalid"
         )
@@ -116,16 +126,37 @@ class Server:
             return
         self._log("WARNING", f"Rejected request {request_path.name!r}: {error}")
 
+    def _should_retry_decode(
+        self,
+        request_path: Path,
+        error: Exception,
+    ) -> bool:
+        now = time.monotonic()
+        first_failure = self._request_decode_failures.setdefault(request_path, now)
+        if now - first_failure >= self.request_decode_grace_s:
+            return False
+        if first_failure == now:
+            self._log(
+                "WARNING",
+                f"Request {request_path.name!r} is not readable yet; will retry: "
+                f"{error}",
+            )
+        return True
+
     def process_pending_requests(self) -> int:
         processed = 0
         for request_path in self.find_new_requests():
             try:
                 with request_path.open("r", encoding="utf-8") as fp:
                     request_content = json.load(fp)
+                self._request_decode_failures.pop(request_path, None)
                 self.handle_request(request_content)
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                if self._should_retry_decode(request_path, error):
+                    continue
+                self._quarantine_request(request_path, error)
+                continue
             except (
-                json.JSONDecodeError,
-                UnicodeDecodeError,
                 TypeError,
                 ValueError,
                 KeyError,
@@ -133,6 +164,7 @@ class Server:
                 self._quarantine_request(request_path, error)
                 continue
             except OSError as error:
+                self._request_decode_failures.pop(request_path, None)
                 # A transient filesystem failure should not stop the server or
                 # discard the request. Leave it in place for the next poll.
                 self._log(

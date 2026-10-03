@@ -191,6 +191,7 @@ class ClientServerTests(unittest.TestCase):
         self.assertEqual(list(self.server.request_path.glob("*.json")), [])
 
     def test_malformed_and_unsafe_requests_are_quarantined(self):
+        self.server.request_decode_grace_s = 0
         malformed_path = self.server.request_path / "malformed.json"
         malformed_path.write_text("{")
         unsafe_path = self.server.request_path / "unsafe.json"
@@ -203,6 +204,23 @@ class ClientServerTests(unittest.TestCase):
         quarantined = list(self.server.request_path.glob("*.invalid"))
         self.assertEqual(len(quarantined), 2)
         self.assertFalse((self.path / "escape.json").exists())
+
+    def test_temporarily_empty_request_is_retried(self):
+        request_id = uuid7()
+        request_path = self.server.request_path / f"{request_id}.json"
+        request_path.write_text("")
+
+        self.assertEqual(self.server.process_pending_requests(), 0)
+        self.assertTrue(request_path.exists())
+        self.assertEqual(list(self.server.request_path.glob("*.invalid")), [])
+
+        _write_json_atomic(
+            request_path,
+            {"id": request_id, "command": "ping", "payload": {}},
+        )
+        self.assertEqual(self.server.process_pending_requests(), 1)
+        response = self.client.wait_for_response(request_id)
+        self.assertEqual(response["status"], "success")
 
     def test_wait_for_response_times_out(self):
         with self.assertRaises(TimeoutError):
@@ -217,6 +235,8 @@ class ClientServerTests(unittest.TestCase):
             Client(self.path, poll_interval_s=-1)
         with self.assertRaisesRegex(ValueError, "Response timeout"):
             Client(self.path, response_timeout_s=-1)
+        with self.assertRaisesRegex(ValueError, "decode grace"):
+            Server(self.path, request_decode_grace_s=-1)
 
     def test_client_requires_response_directory(self):
         with tempfile.TemporaryDirectory() as directory:
