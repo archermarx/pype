@@ -222,9 +222,51 @@ class ClientServerTests(unittest.TestCase):
         response = self.client.wait_for_response(request_id)
         self.assertEqual(response["status"], "success")
 
+    def test_completed_request_that_reappears_empty_is_discarded(self):
+        request_id = uuid7()
+        request_path = self.server.request_path / f"{request_id}.json"
+        _write_json_atomic(
+            request_path,
+            {"id": request_id, "command": "ping", "payload": {}},
+        )
+
+        self.assertEqual(self.server.process_pending_requests(), 1)
+        self.client.wait_for_response(request_id)
+
+        request_path.write_text("")
+        self.assertEqual(self.server.process_pending_requests(), 0)
+
+        self.assertFalse(request_path.exists())
+        self.assertEqual(list(self.server.request_path.glob("*.invalid")), [])
+
     def test_wait_for_response_times_out(self):
         with self.assertRaises(TimeoutError):
             self.client.wait_for_response(uuid7(), timeout_s=0.005)
+
+    def test_temporarily_empty_response_is_retried(self):
+        request_id = uuid7()
+        response_path = self.server.response_path / f"{request_id}.json"
+        response_path.write_text("")
+
+        def publish_response():
+            time.sleep(0.005)
+            _write_json_atomic(
+                response_path,
+                {
+                    "id": request_id,
+                    "command": "ping",
+                    "status": "success",
+                    "payload": {},
+                },
+            )
+
+        publisher = threading.Thread(target=publish_response)
+        publisher.start()
+        response = self.client.wait_for_response(request_id, timeout_s=0.1)
+        publisher.join(timeout=1)
+
+        self.assertEqual(response["status"], "success")
+        self.assertFalse(response_path.exists())
 
     def test_generic_request_accepts_a_per_request_timeout(self):
         with self.assertRaises(TimeoutError):

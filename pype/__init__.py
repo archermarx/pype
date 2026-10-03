@@ -9,6 +9,7 @@ import uuid
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+_COMPLETED_REQUEST_CACHE_SIZE = 10_000
 
 def uuid7() -> str:
     ts = time.time_ns() // 1_000_000  # 48 bits
@@ -79,6 +80,7 @@ class Server:
         self.poll_interval_s = poll_interval_s
         self.request_decode_grace_s = request_decode_grace_s
         self._request_decode_failures: dict[Path, float] = {}
+        self._completed_request_ids: dict[str, None] = {}
         self.log_path = self.path / "pype.log"
         self._log_lock = threading.Lock()
 
@@ -143,14 +145,40 @@ class Server:
             )
         return True
 
+    def _remember_completed_request(self, request_id: str) -> None:
+        self._completed_request_ids[request_id] = None
+        if len(self._completed_request_ids) > _COMPLETED_REQUEST_CACHE_SIZE:
+            oldest_request_id = next(iter(self._completed_request_ids))
+            del self._completed_request_ids[oldest_request_id]
+
+    def _discard_completed_request(self, request_path: Path) -> bool:
+        request_id = request_path.stem
+        if not _REQUEST_ID_PATTERN.fullmatch(request_id):
+            return False
+
+        response_exists = (self.response_path / request_path.name).exists()
+        if request_id not in self._completed_request_ids and not response_exists:
+            return False
+
+        self._remember_completed_request(request_id)
+        self._request_decode_failures.pop(request_path, None)
+        request_path.unlink(missing_ok=True)
+        self._log(
+            "INFO",
+            f"Discarded duplicate completed request request_id={request_id!r}",
+        )
+        return True
+
     def process_pending_requests(self) -> int:
         processed = 0
         for request_path in self.find_new_requests():
+            if self._discard_completed_request(request_path):
+                continue
             try:
                 with request_path.open("r", encoding="utf-8") as fp:
                     request_content = json.load(fp)
                 self._request_decode_failures.pop(request_path, None)
-                self.handle_request(request_content)
+                request_id = self.handle_request(request_content)
             except (json.JSONDecodeError, UnicodeDecodeError) as error:
                 if self._should_retry_decode(request_path, error):
                     continue
@@ -173,6 +201,7 @@ class Server:
                 )
                 continue
 
+            self._remember_completed_request(request_id)
             request_path.unlink(missing_ok=True)
             processed += 1
         return processed
@@ -182,7 +211,7 @@ class Server:
             self.process_pending_requests()
             time.sleep(self.poll_interval_s)
 
-    def handle_request(self, request: dict):
+    def handle_request(self, request: dict) -> str:
         if not isinstance(request, dict):
             raise TypeError("Request must be a JSON object")
 
@@ -225,6 +254,7 @@ class Server:
             response["status"] = "error_action_failed"
             response["payload"] = {"message": str(error)}
             _write_json_atomic(response_path, response)
+        return request_id
 
 
 class Client:
@@ -265,18 +295,33 @@ class Client:
 
         target_path = self.response_path / f"{request_id}.json"
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        last_decode_error = None
 
-        while not target_path.exists():
+        while True:
+            if target_path.exists():
+                try:
+                    with target_path.open("r", encoding="utf-8") as fp:
+                        response = json.load(fp)
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    last_decode_error = error
+                except FileNotFoundError:
+                    # The sharing layer may invalidate a cached directory entry
+                    # between exists() and open(). Poll it again.
+                    pass
+                else:
+                    target_path.unlink(missing_ok=True)
+                    return response
+
             if deadline is not None and time.monotonic() >= deadline:
+                if last_decode_error is not None:
+                    raise TimeoutError(
+                        "Timed out waiting for a readable response to request "
+                        f"{request_id}"
+                    ) from last_decode_error
                 raise TimeoutError(
                     f"Timed out waiting for response to request {request_id}"
                 )
             time.sleep(self.poll_interval_s)
-
-        with target_path.open("r", encoding="utf-8") as fp:
-            response = json.load(fp)
-        target_path.unlink(missing_ok=True)
-        return response
 
     def request(
         self,
