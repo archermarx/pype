@@ -8,7 +8,14 @@ import time
 import unittest
 from unittest import mock
 
-from pype import Client, Server, _write_json_atomic, uuid7
+from pype import (
+    Client,
+    NetworkClient,
+    NetworkServer,
+    Server,
+    _write_json_atomic,
+    uuid7,
+)
 
 
 class AtomicWriteTests(unittest.TestCase):
@@ -286,6 +293,84 @@ class ClientServerTests(unittest.TestCase):
             (path / "request").mkdir()
             with self.assertRaisesRegex(FileNotFoundError, "Response directory"):
                 Client(path)
+
+
+class NetworkClientServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary_directory.name)
+        self.token = "test-token"
+        self.server = NetworkServer(
+            self.path,
+            port=0,
+            token=self.token,
+            poll_interval_s=0.001,
+        )
+        self.server_thread = threading.Thread(target=self.server.listen)
+        self.server_thread.start()
+        self.client = NetworkClient(
+            "127.0.0.1",
+            self.server.port,
+            token=self.token,
+            response_timeout_s=1,
+        )
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server_thread.join(timeout=1)
+        self.temporary_directory.cleanup()
+
+    def test_request_round_trip(self):
+        payload, elapsed = self.client.request(
+            "echo",
+            {"value": 42, "message": "line one\nline two"},
+        )
+
+        self.assertEqual(
+            payload,
+            {"value": 42, "message": "line one\nline two"},
+        )
+        self.assertGreaterEqual(elapsed, 0)
+
+    def test_registered_action_and_action_error(self):
+        def double(path, request_id, payload):
+            return {"value": payload["value"] * 2}
+
+        def fail(path, request_id, payload):
+            raise RuntimeError("network action failed")
+
+        self.server.register_action("double", double)
+        self.server.register_action("fail", fail)
+
+        payload, _ = self.client.request("double", {"value": 21})
+        self.assertEqual(payload, {"value": 42})
+        with self.assertRaisesRegex(RuntimeError, "network action failed"):
+            self.client.request("fail")
+
+    def test_wrong_token_is_rejected(self):
+        client = NetworkClient(
+            "127.0.0.1",
+            self.server.port,
+            token="wrong-token",
+            response_timeout_s=1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+            client.request("ping")
+
+    def test_commands_are_logged_without_payload_or_token(self):
+        self.client.request("echo", {"secret": "payload-secret"})
+
+        log = (self.path / "pype.log").read_text(encoding="utf-8")
+        self.assertIn("command='echo'", log)
+        self.assertNotIn("payload-secret", log)
+        self.assertNotIn(self.token, log)
+
+    def test_invalid_options_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "token"):
+            NetworkClient(token="")
+        with self.assertRaisesRegex(ValueError, "port"):
+            NetworkClient(port=0, token=self.token)
 
 
 if __name__ == "__main__":

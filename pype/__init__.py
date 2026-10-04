@@ -1,15 +1,20 @@
+import hmac
+from http import HTTPStatus
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
 import re
 import threading
 import time
-from typing import Callable
+from typing import Callable, cast
 import uuid
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _COMPLETED_REQUEST_CACHE_SIZE = 10_000
+_MAX_NETWORK_MESSAGE_BYTES = 16 * 1024 * 1024
 
 def uuid7() -> str:
     ts = time.time_ns() // 1_000_000  # 48 bits
@@ -47,6 +52,40 @@ def _validate_request_id(request_id: object) -> str:
     ):
         raise ValueError("Request id must be a 32-character lowercase hexadecimal UUID")
     return request_id
+
+
+def _validate_token(token: object) -> str:
+    if not isinstance(token, str) or not token:
+        raise ValueError("Network authentication token must be a non-empty string")
+    if "\r" in token or "\n" in token:
+        raise ValueError("Network authentication token cannot contain newlines")
+    return token
+
+
+def _validate_response(
+    response: object,
+    request_id: str,
+    command: str,
+) -> dict:
+    if not isinstance(response, dict):
+        raise RuntimeError("Server response must be a JSON object")
+    if response.get("id") != request_id:
+        raise RuntimeError("Server response has an unexpected request id")
+    if response.get("command") != command:
+        acknowledged_command = response.get("command")
+        raise RuntimeError(
+            "Server response acknowledged the wrong command. "
+            f"Expected {command}, got {acknowledged_command}"
+        )
+    if response.get("status") != "success":
+        raise RuntimeError(
+            f"Server returned an error: {response.get('status')}; "
+            f"payload={response.get('payload')}"
+        )
+    response_payload = response.get("payload")
+    if not isinstance(response_payload, dict):
+        raise RuntimeError("Server response payload must be a JSON object")
+    return response_payload
 
 
 # Built-in actions
@@ -211,7 +250,7 @@ class Server:
             self.process_pending_requests()
             time.sleep(self.poll_interval_s)
 
-    def handle_request(self, request: dict) -> str:
+    def _build_response(self, request: dict) -> dict:
         if not isinstance(request, dict):
             raise TypeError("Request must be a JSON object")
 
@@ -245,15 +284,22 @@ class Server:
                 response["status"] = "success"
                 response["payload"] = response_payload
 
-        response_path = self.response_path / f"{request_id}.json"
         try:
-            _write_json_atomic(response_path, response)
+            # Validate here so every transport reports a bad action result in
+            # the same way, before attempting to publish it.
+            json.dumps(response)
         except (TypeError, ValueError) as error:
             if response["status"] != "success":
                 raise
             response["status"] = "error_action_failed"
             response["payload"] = {"message": str(error)}
-            _write_json_atomic(response_path, response)
+        return response
+
+    def handle_request(self, request: dict) -> str:
+        response = self._build_response(request)
+        request_id = response["id"]
+        response_path = self.response_path / f"{request_id}.json"
+        _write_json_atomic(response_path, response)
         return request_id
 
 
@@ -348,27 +394,213 @@ class Client:
         end_time = time.monotonic_ns()
         elapsed = (end_time - start_time) / 1e9
 
-        if not isinstance(response, dict):
-            raise RuntimeError("Server response must be a JSON object")
-        if response.get("id") != request_id:
-            raise RuntimeError("Server response has an unexpected request id")
-        if response.get("command") != command:
-            acknowledged_command = response.get("command")
-            raise RuntimeError(
-                "Server response acknowledged the wrong command. "
-                f"Expected {command}, got {acknowledged_command}"
-            )
-        if response.get("status") != "success":
-            raise RuntimeError(
-                f"Server returned an error: {response.get('status')}; "
-                f"payload={response.get('payload')}"
-            )
-        response_payload = response.get("payload")
-        if not isinstance(response_payload, dict):
-            raise RuntimeError("Server response payload must be a JSON object")
-
-        return response_payload, elapsed
+        return _validate_response(response, request_id, command), elapsed
 
     def ping(self):
+        _, elapsed = self.request("ping", {})
+        print(f"Ping time: {elapsed:.3g} seconds")
+
+
+class _NetworkRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send_json(self, status: HTTPStatus, value: object) -> None:
+        body = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The action may complete after a client-side timeout or a closed
+            # SSH tunnel. There is no response channel left in that case.
+            pass
+
+    def _send_error(self, status: HTTPStatus, message: str) -> None:
+        self._send_json(
+            status,
+            {"status": "error_invalid_request", "payload": {"message": message}},
+        )
+
+    def do_POST(self) -> None:
+        network_server = cast("_PypeHTTPServer", self.server).pype_server
+
+        if self.path != "/request":
+            self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+            return
+
+        expected_authorization = f"Bearer {network_server.token}"
+        authorization = self.headers.get("Authorization", "")
+        if not hmac.compare_digest(authorization, expected_authorization):
+            self._send_error(HTTPStatus.UNAUTHORIZED, "Authentication failed")
+            return
+
+        content_length_header = self.headers.get("Content-Length")
+        try:
+            content_length = int(content_length_header)
+        except (TypeError, ValueError):
+            self._send_error(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+            return
+
+        if content_length < 0 or content_length > _MAX_NETWORK_MESSAGE_BYTES:
+            self._send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request is too large")
+            return
+
+        body = self.rfile.read(content_length)
+        try:
+            request = json.loads(body.decode("utf-8"))
+            response = network_server._build_response(request)
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            TypeError,
+            ValueError,
+            KeyError,
+        ) as error:
+            self._send_error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+
+        self._send_json(HTTPStatus.OK, response)
+
+    def log_message(self, format: str, *args: object) -> None:
+        # Commands are logged by Server._build_response. Suppressing the
+        # standard access log keeps noisy request metadata out of pype.log.
+        return
+
+
+class _PypeHTTPServer(HTTPServer):
+    def __init__(self, server_address, pype_server):
+        self.pype_server = pype_server
+        super().__init__(server_address, _NetworkRequestHandler)
+
+
+class NetworkServer(Server):
+    """Serve Pype requests over TCP for forwarding through an SSH tunnel."""
+
+    def __init__(
+        self,
+        path,
+        host="127.0.0.1",
+        port=8765,
+        *,
+        token,
+        poll_interval_s=0.1,
+    ):
+        if not isinstance(host, str) or not host:
+            raise ValueError("Network host must be a non-empty string")
+        if (
+            not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 0 <= port <= 65535
+        ):
+            raise ValueError("Network port must be an integer from 0 through 65535")
+
+        super().__init__(path, poll_interval_s=poll_interval_s)
+        self.token = _validate_token(token)
+        self._http_server = _PypeHTTPServer((host, port), self)
+        self.host = self._http_server.server_address[0]
+        self.port = self._http_server.server_address[1]
+
+    def listen(self) -> None:
+        self._log("INFO", f"Listening on {self.host}:{self.port}")
+        try:
+            self._http_server.serve_forever(poll_interval=self.poll_interval_s)
+        finally:
+            self._http_server.server_close()
+
+    def shutdown(self) -> None:
+        self._http_server.shutdown()
+
+
+class NetworkClient:
+    """Send Pype requests to a localhost port forwarded by SSH."""
+
+    def __init__(
+        self,
+        host="127.0.0.1",
+        port=8765,
+        *,
+        token,
+        response_timeout_s=30.0,
+    ):
+        if not isinstance(host, str) or not host:
+            raise ValueError("Network host must be a non-empty string")
+        if (
+            not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError("Network port must be an integer from 1 through 65535")
+        if response_timeout_s is not None and response_timeout_s < 0:
+            raise ValueError("Response timeout must be non-negative or None")
+
+        self.host = host
+        self.port = port
+        self.token = _validate_token(token)
+        self.response_timeout_s = response_timeout_s
+
+    def request(
+        self,
+        command: str,
+        payload: dict | None = None,
+        *,
+        timeout_s: float | None = None,
+    ) -> tuple[dict, float]:
+        if not isinstance(command, str):
+            raise TypeError("Request command must be a string")
+        if payload is None:
+            payload = {}
+        elif not isinstance(payload, dict):
+            raise TypeError("Request payload must be a JSON object")
+        if timeout_s is None:
+            timeout_s = self.response_timeout_s
+        if timeout_s is not None and timeout_s < 0:
+            raise ValueError("Response timeout must be non-negative or None")
+
+        request_id = uuid7()
+        request = {"id": request_id, "command": command, "payload": payload}
+        try:
+            request_body = json.dumps(request, separators=(",", ":"))
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "Request must contain only JSON-serializable values"
+            ) from error
+
+        start_time = time.monotonic_ns()
+        connection = HTTPConnection(self.host, self.port, timeout=timeout_s)
+        try:
+            connection.request(
+                "POST",
+                "/request",
+                body=request_body.encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            http_response = connection.getresponse()
+            response_body = http_response.read(_MAX_NETWORK_MESSAGE_BYTES + 1)
+        finally:
+            connection.close()
+        end_time = time.monotonic_ns()
+
+        if len(response_body) > _MAX_NETWORK_MESSAGE_BYTES:
+            raise RuntimeError("Server response is too large")
+        try:
+            response = json.loads(response_body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise RuntimeError("Server returned an invalid JSON response") from error
+        if http_response.status != HTTPStatus.OK:
+            message = response.get("payload", {}).get("message")
+            raise RuntimeError(
+                f"Server returned HTTP {http_response.status}: {message}"
+            )
+
+        elapsed = (end_time - start_time) / 1e9
+        return _validate_response(response, request_id, command), elapsed
+
+    def ping(self) -> None:
         _, elapsed = self.request("ping", {})
         print(f"Ping time: {elapsed:.3g} seconds")
