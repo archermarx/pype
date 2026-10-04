@@ -14,7 +14,7 @@ import uuid
 
 _REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _COMPLETED_REQUEST_CACHE_SIZE = 10_000
-_MAX_NETWORK_MESSAGE_BYTES = 16 * 1024 * 1024
+_MAX_NETWORK_MESSAGE_BYTES = 128 * 1024 * 1024
 
 def uuid7() -> str:
     ts = time.time_ns() // 1_000_000  # 48 bits
