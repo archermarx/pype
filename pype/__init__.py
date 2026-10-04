@@ -245,7 +245,7 @@ class Server:
             processed += 1
         return processed
 
-    def listen(self):
+    def listen(self) -> None:
         while True:
             self.process_pending_requests()
             time.sleep(self.poll_interval_s)
@@ -438,10 +438,13 @@ class _NetworkRequestHandler(BaseHTTPRequestHandler):
             return
 
         content_length_header = self.headers.get("Content-Length")
+        if content_length_header is None:
+            self._send_error(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+            return
         try:
             content_length = int(content_length_header)
-        except (TypeError, ValueError):
-            self._send_error(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+        except ValueError:
+            self._send_error(HTTPStatus.BAD_REQUEST, "Content-Length must be an integer")
             return
 
         if content_length < 0 or content_length > _MAX_NETWORK_MESSAGE_BYTES:
